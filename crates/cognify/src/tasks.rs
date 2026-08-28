@@ -93,6 +93,10 @@ pub struct CognifyInput {
 #[derive(Debug, Clone)]
 pub struct ClassifiedDocuments {
     pub documents: Vec<Document>,
+    /// Items dropped for an unmappable extension. Seeds the report the
+    /// chunking stage carries forward, so an unclassifiable file reaches the
+    /// run result as a failure instead of silently vanishing.
+    pub failures: FailureReport,
     pub dataset_id: Uuid,
     pub user_id: Option<Uuid>,
     pub tenant_id: Option<Uuid>,
@@ -263,11 +267,47 @@ impl LedgerIdentity {
 ///
 /// Maps each Data item to a Document based on mime_type.
 /// Non-text items are filtered out.
-pub fn classify_documents(input: &CognifyInput) -> Result<ClassifiedDocuments, CognifyError> {
+pub fn classify_documents(
+    input: &CognifyInput,
+    failure_policy: FailurePolicy,
+) -> Result<ClassifiedDocuments, CognifyError> {
     let documents: Vec<Document> = model_classify_documents(&input.data_items);
     info!(doc_count = documents.len(), "documents classified");
+
+    // `model_classify_documents` filter_maps items whose extension maps to no
+    // document type (`md`, `json`, `xml`, `yaml`, anything unmapped). They are
+    // dropped silently, so without this they are neither failed nor unreached
+    // and a completing run would mark them done — and, since markers now skip,
+    // never revisit them. Record each as a file-unit failure instead.
+    let mut failures = FailureReport::with_policy(&failure_policy);
+    if documents.len() != input.data_items.len() {
+        let classified: HashSet<Uuid> = documents.iter().map(|d| d.data_id).collect();
+        for item in input
+            .data_items
+            .iter()
+            .filter(|d| !classified.contains(&d.id))
+        {
+            warn!(
+                data_id = %item.id,
+                extension = %item.extension,
+                "no document type for this extension; the item cannot be cognified"
+            );
+            failures.record(StageFailure {
+                stage: FailureStage::Classification,
+                data_id: item.id,
+                chunk_id: None,
+                error: format!(
+                    "no document type is registered for extension `{}`",
+                    item.extension
+                ),
+                fails_item: true,
+            });
+        }
+    }
+
     Ok(ClassifiedDocuments {
         documents,
+        failures,
         dataset_id: input.dataset_id,
         user_id: input.user_id,
         tenant_id: input.tenant_id,
@@ -447,7 +487,11 @@ pub async fn extract_chunks_from_documents(
         .map_err(|e| CognifyError::ChunkingError(e.to_string()))?;
     let mut all_chunks = Vec::new();
     let mut kept_documents: Vec<Document> = Vec::new();
-    let mut failures = FailureReport::with_policy(&failure_policy);
+    // Seeded from classification so items dropped there stay in the report.
+    let mut failures = input.failures.clone();
+    // Denominator counts everything handed to the run, including items
+    // classification already dropped — they never become `documents`.
+    let item_total = input.documents.len() + failures.entries().len();
 
     for (index, document) in input.documents.iter().enumerate() {
         let outcome = chunk_one_document(
@@ -482,7 +526,7 @@ pub async fn extract_chunks_from_documents(
                     // The denominators are set on every exit path, so the ratio
                     // and the "nothing survived" backstop can be evaluated on
                     // the report whatever happens next.
-                    failures.note_totals(input.documents.len(), all_chunks.len());
+                    failures.note_totals(item_total, all_chunks.len());
                     if failure_policy.scope != RollbackScope::FailedItems {
                         return Err(CognifyError::RunFailed {
                             report: Box::new(failures),
@@ -507,7 +551,7 @@ pub async fn extract_chunks_from_documents(
         kept_documents.push(document.clone());
     }
 
-    failures.note_totals(input.documents.len(), all_chunks.len());
+    failures.note_totals(item_total, all_chunks.len());
     info!(total_chunks = all_chunks.len(), "chunking complete");
     Ok(ExtractedChunks {
         chunks: all_chunks,
@@ -5039,20 +5083,23 @@ fn pipeline_run_id_from_ctx(ctx: &Arc<cognee_core::TaskContext>) -> Option<Uuid>
 /// "classify_documents"`. Necessary because `ClassifiedDocuments` is a
 /// non-`HasDataPoint` wrapper not walked by the executor's `stamp_tree_dyn`
 /// (LIB-06-03 fixup).
-pub fn make_classify_documents_task() -> TypedTask<CognifyInput, ClassifiedDocuments> {
-    make_classify_documents_task_with_rank(CLASSIFY_DOCUMENTS_TASK_RANK)
+pub fn make_classify_documents_task(
+    failure_policy: FailurePolicy,
+) -> TypedTask<CognifyInput, ClassifiedDocuments> {
+    make_classify_documents_task_with_rank(CLASSIFY_DOCUMENTS_TASK_RANK, failure_policy)
 }
 
 /// [`make_classify_documents_task`] with a caller-chosen `topological_rank`.
 pub fn make_classify_documents_task_with_rank(
     rank: i32,
+    failure_policy: FailurePolicy,
 ) -> TypedTask<CognifyInput, ClassifiedDocuments> {
     TypedTask::sync(move |input: &CognifyInput, ctx| {
         // `?` boxes the `CognifyError` rather than stringifying it, so
         // `cognify()` can downcast the executor's `TaskFailed` back to the
         // typed error — which is what turns a failure that is "merely thrown"
         // into one that is reported.
-        let mut classified = classify_documents(input)?;
+        let mut classified = classify_documents(input, failure_policy)?;
         let user_label = user_label_from_ctx(&ctx);
         for doc in &mut classified.documents {
             stamp_provenance(
@@ -5525,42 +5572,45 @@ pub fn build_cognify_pipeline(
     config: CognifyConfig,
 ) -> Pipeline {
     let loader_registry = Arc::new(build_loader_registry(&llm, &config));
-    PipelineBuilder::new_with_task(COGNIFY_PIPELINE_STAMP_NAME, make_classify_documents_task())
-        .with_first_task_name(CLASSIFY_DOCUMENTS_TASK_NAME)
-        .add_task_named(
-            make_extract_chunks_task(
-                storage,
-                config.chunk_size(),
-                config.token_counter_kind.clone(),
-                // Still `Option`: the chunk stage uses the connection for
-                // incremental-loading bookkeeping, not for writing artifacts,
-                // so it is not part of this invariant.
-                Some(Arc::clone(&db)),
-                loader_registry,
-                config.failure_policy(),
-            ),
-            EXTRACT_CHUNKS_TASK_NAME,
-        )
-        .add_task_named(
-            make_extract_graph_task(
-                Arc::clone(&llm),
-                Arc::clone(&graph_db),
-                ontology_resolver,
-                Arc::clone(&db),
-                config.clone(),
-            ),
-            EXTRACT_GRAPH_TASK_NAME,
-        )
-        .add_task_named(
-            make_summarize_text_task(llm, config.clone()),
-            SUMMARIZE_TEXT_TASK_NAME,
-        )
-        .add_task_named(
-            make_add_data_points_task(graph_db, vector_db, embedding_engine, db, config),
-            ADD_DATA_POINTS_TASK_NAME,
-        )
-        .with_name(COGNIFY_PIPELINE_STAMP_NAME)
-        .build()
+    PipelineBuilder::new_with_task(
+        COGNIFY_PIPELINE_STAMP_NAME,
+        make_classify_documents_task(config.failure_policy()),
+    )
+    .with_first_task_name(CLASSIFY_DOCUMENTS_TASK_NAME)
+    .add_task_named(
+        make_extract_chunks_task(
+            storage,
+            config.chunk_size(),
+            config.token_counter_kind.clone(),
+            // Still `Option`: the chunk stage uses the connection for
+            // incremental-loading bookkeeping, not for writing artifacts,
+            // so it is not part of this invariant.
+            Some(Arc::clone(&db)),
+            loader_registry,
+            config.failure_policy(),
+        ),
+        EXTRACT_CHUNKS_TASK_NAME,
+    )
+    .add_task_named(
+        make_extract_graph_task(
+            Arc::clone(&llm),
+            Arc::clone(&graph_db),
+            ontology_resolver,
+            Arc::clone(&db),
+            config.clone(),
+        ),
+        EXTRACT_GRAPH_TASK_NAME,
+    )
+    .add_task_named(
+        make_summarize_text_task(llm, config.clone()),
+        SUMMARIZE_TEXT_TASK_NAME,
+    )
+    .add_task_named(
+        make_add_data_points_task(graph_db, vector_db, embedding_engine, db, config),
+        ADD_DATA_POINTS_TASK_NAME,
+    )
+    .with_name(COGNIFY_PIPELINE_STAMP_NAME)
+    .build()
 }
 
 /// Build a [`TypedTask`] that extracts temporal events from chunks via LLM.
@@ -5643,35 +5693,38 @@ pub fn build_temporal_cognify_pipeline(
     config: CognifyConfig,
 ) -> Pipeline {
     let loader_registry = Arc::new(build_loader_registry(&llm, &config));
-    PipelineBuilder::new_with_task("temporal-cognify", make_classify_documents_task())
-        .with_first_task_name(CLASSIFY_DOCUMENTS_TASK_NAME)
-        .add_task_named(
-            make_extract_chunks_task(
-                storage,
-                config.chunk_size(),
-                config.token_counter_kind.clone(),
-                Some(Arc::clone(&db)),
-                loader_registry,
-                config.failure_policy(),
-            ),
-            EXTRACT_CHUNKS_TASK_NAME,
-        )
-        .add_task_named(
-            make_extract_temporal_events_task(llm, config.clone()),
-            "extract_temporal_events",
-        )
-        .add_task_named(
-            make_add_temporal_data_points_task(
-                graph_db,
-                vector_db,
-                embedding_engine,
-                db,
-                config.failure_policy(),
-            ),
-            "add_temporal_data_points",
-        )
-        .with_name("temporal-cognify")
-        .build()
+    PipelineBuilder::new_with_task(
+        "temporal-cognify",
+        make_classify_documents_task(config.failure_policy()),
+    )
+    .with_first_task_name(CLASSIFY_DOCUMENTS_TASK_NAME)
+    .add_task_named(
+        make_extract_chunks_task(
+            storage,
+            config.chunk_size(),
+            config.token_counter_kind.clone(),
+            Some(Arc::clone(&db)),
+            loader_registry,
+            config.failure_policy(),
+        ),
+        EXTRACT_CHUNKS_TASK_NAME,
+    )
+    .add_task_named(
+        make_extract_temporal_events_task(llm, config.clone()),
+        "extract_temporal_events",
+    )
+    .add_task_named(
+        make_add_temporal_data_points_task(
+            graph_db,
+            vector_db,
+            embedding_engine,
+            db,
+            config.failure_policy(),
+        ),
+        "add_temporal_data_points",
+    )
+    .with_name("temporal-cognify")
+    .build()
 }
 
 #[cfg(test)]
@@ -5752,7 +5805,7 @@ mod tests {
             user_id: None,
             tenant_id: None,
         };
-        let result = classify_documents(&input).unwrap();
+        let result = classify_documents(&input, FailurePolicy::default()).unwrap();
         assert!(result.documents.is_empty());
     }
 
@@ -5776,8 +5829,90 @@ mod tests {
             user_id: None,
             tenant_id: None,
         };
-        let result = classify_documents(&input).unwrap();
+        let result = classify_documents(&input, FailurePolicy::default()).unwrap();
         assert_eq!(result.documents.len(), 1);
+    }
+
+    /// An item classification drops is recorded as a failure, not lost.
+    ///
+    /// Regression: `model_classify_documents` filter_maps unmappable
+    /// extensions, so such an item produced no `Document` and appeared in
+    /// neither the failed nor the unreached set. A completing run therefore
+    /// marked it done, and because completion markers now cause skipping, it
+    /// would never be retried — a `.md` file silently never cognified, forever.
+    #[test]
+    fn unclassifiable_items_are_recorded_as_failures() {
+        let good = Data::builder(
+            Uuid::new_v4(),
+            "notes.txt",
+            "/storage/notes.txt",
+            "file://notes.txt",
+            "txt",
+            "text/plain",
+            "hash-good",
+            Uuid::new_v4(),
+        )
+        .build();
+        let dropped = Data::builder(
+            Uuid::new_v4(),
+            "README.md",
+            "/storage/README.md",
+            "file://README.md",
+            "md",
+            "text/markdown",
+            "hash-md",
+            Uuid::new_v4(),
+        )
+        .build();
+        let dropped_id = dropped.id;
+
+        let input = CognifyInput {
+            data_items: vec![good, dropped],
+            dataset_id: Uuid::new_v4(),
+            user_id: None,
+            tenant_id: None,
+        };
+
+        let result = classify_documents(&input, FailurePolicy::default()).unwrap();
+
+        assert_eq!(result.documents.len(), 1, "only the .txt item classifies");
+        let entries = result.failures.entries();
+        assert_eq!(entries.len(), 1, "the dropped .md item must be recorded");
+        assert_eq!(entries[0].stage, FailureStage::Classification);
+        assert_eq!(entries[0].data_id, dropped_id);
+        assert!(entries[0].fails_item, "a dropped item must fail its item");
+        assert!(
+            entries[0].error.contains("md"),
+            "the error should name the offending extension: {}",
+            entries[0].error
+        );
+    }
+
+    /// The happy path records nothing — the check must not fire on every run.
+    #[test]
+    fn fully_classifiable_input_records_no_failures() {
+        let data = Data::builder(
+            Uuid::new_v4(),
+            "notes.txt",
+            "/storage/notes.txt",
+            "file://notes.txt",
+            "txt",
+            "text/plain",
+            "hash-good",
+            Uuid::new_v4(),
+        )
+        .build();
+
+        let input = CognifyInput {
+            data_items: vec![data],
+            dataset_id: Uuid::new_v4(),
+            user_id: None,
+            tenant_id: None,
+        };
+
+        let result = classify_documents(&input, FailurePolicy::default()).unwrap();
+        assert_eq!(result.documents.len(), 1);
+        assert!(result.failures.entries().is_empty());
     }
 
     #[test]
@@ -5800,7 +5935,7 @@ mod tests {
             user_id: None,
             tenant_id: None,
         };
-        let result = classify_documents(&input).unwrap();
+        let result = classify_documents(&input, FailurePolicy::default()).unwrap();
         assert!(result.documents.is_empty());
     }
 
@@ -5829,6 +5964,7 @@ mod tests {
         };
 
         let input = ClassifiedDocuments {
+            failures: FailureReport::default(),
             documents: vec![doc],
             dataset_id: Uuid::new_v4(),
             user_id: None,
@@ -6492,6 +6628,7 @@ mod tests {
     async fn test_extract_chunks_empty_documents() {
         let storage = Arc::new(MockStorage::new());
         let input = ClassifiedDocuments {
+            failures: FailureReport::default(),
             documents: vec![],
             dataset_id: Uuid::new_v4(),
             user_id: None,
@@ -6538,6 +6675,7 @@ mod tests {
         };
 
         let input = ClassifiedDocuments {
+            failures: FailureReport::default(),
             documents: vec![doc],
             dataset_id: Uuid::new_v4(),
             user_id: None,
@@ -6616,6 +6754,7 @@ mod tests {
 
         (
             ClassifiedDocuments {
+                failures: FailureReport::default(),
                 documents,
                 dataset_id: Uuid::new_v4(),
                 user_id: None,
@@ -6797,7 +6936,7 @@ mod tests {
             user_id: None,
             tenant_id: None,
         };
-        let result = classify_documents(&input).unwrap();
+        let result = classify_documents(&input, FailurePolicy::default()).unwrap();
         assert_eq!(result.dataset_id, dataset_id);
     }
 
@@ -7713,6 +7852,7 @@ mod tests {
         };
 
         let input = ClassifiedDocuments {
+            failures: FailureReport::default(),
             documents: vec![doc],
             dataset_id: Uuid::new_v4(),
             user_id: None,
@@ -7783,6 +7923,7 @@ mod tests {
         };
 
         let input = ClassifiedDocuments {
+            failures: FailureReport::default(),
             documents: vec![doc],
             dataset_id: Uuid::new_v4(),
             user_id: None,
@@ -7849,7 +7990,8 @@ mod tests {
                 user_id: None,
                 tenant_id: None,
             };
-            let result = classify_documents(&input).expect("classify should not error");
+            let result = classify_documents(&input, FailurePolicy::default())
+                .expect("classify should not error");
             assert_eq!(
                 result.documents.len(),
                 1,
@@ -7907,8 +8049,8 @@ mod tests {
         };
 
         // Regression 1: classify must not drop the HTML file.
-        let classified =
-            classify_documents(&input).expect("classify_documents must succeed for html");
+        let classified = classify_documents(&input, FailurePolicy::default())
+            .expect("classify_documents must succeed for html");
         assert_eq!(
             classified.documents.len(),
             1,
@@ -7978,6 +8120,7 @@ mod tests {
         };
 
         let input = ClassifiedDocuments {
+            failures: FailureReport::default(),
             documents: vec![doc],
             dataset_id: Uuid::new_v4(),
             user_id: None,

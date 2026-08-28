@@ -69,6 +69,14 @@ pub enum RollbackScope {
 /// Which stage produced a failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FailureStage {
+    /// Determining a data item's document type. Failure unit is the file.
+    ///
+    /// Recorded when an item's extension maps to no document type, so
+    /// `classify_documents` produces no `Document` for it and nothing
+    /// downstream ever sees it. Left unrecorded, such an item is neither
+    /// failed nor unreached, so a completing run marks it done and the
+    /// completion marker then skips it forever.
+    Classification,
     /// Reading or chunking a data item. Failure unit is the file.
     Chunking,
     /// LLM graph extraction. Failure unit is the chunk.
@@ -88,6 +96,7 @@ pub enum FailureStage {
 impl fmt::Display for FailureStage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
+            FailureStage::Classification => "classification",
             FailureStage::Chunking => "chunking",
             FailureStage::GraphExtraction => "graph extraction",
             FailureStage::Summarization => "summarization",
