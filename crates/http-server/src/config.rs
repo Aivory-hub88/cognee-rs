@@ -142,6 +142,12 @@ pub struct HttpServerConfig {
     /// Env: `GRAPH_FILE_PATH`.
     pub graph_file_path: PathBuf,
 
+    /// Postgres connection string for the `postgres` graph provider
+    /// (`pggraph` crate feature — graph-as-tables). Unset by default: the
+    /// standalone server historically only wired the embedded ladybug graph.
+    /// Env: `GRAPH_POSTGRES_URL`.
+    pub graph_postgres_url: Option<String>,
+
     /// Vector provider name.
     /// Env: `VECTOR_DB_PROVIDER`. Default: `pgvector`.
     /// Note: the qdrant adapter has been extracted to the closed
@@ -371,6 +377,7 @@ impl Default for HttpServerConfig {
             relational_db_url: default_relational_db_url(&system_root),
             graph_provider: "ladybug".to_string(),
             graph_file_path: default_graph_file_path(&system_root),
+            graph_postgres_url: None,
             vector_provider: "pgvector".to_string(),
             vector_db_url: default_vector_db_url(&system_root),
             embedding_provider: "onnx".to_string(),
@@ -538,6 +545,9 @@ impl HttpServerConfig {
         }
         if let Ok(v) = std::env::var("GRAPH_FILE_PATH") {
             cfg.graph_file_path = PathBuf::from(v);
+        }
+        if let Ok(v) = std::env::var("GRAPH_POSTGRES_URL") {
+            cfg.graph_postgres_url = Some(v);
         }
 
         if let Ok(v) = std::env::var("VECTOR_DB_PROVIDER") {
@@ -748,9 +758,16 @@ impl HttpServerConfig {
             relational_db_url: ensure_sqlite_rwc(&self.relational_db_url),
             graph_provider: self.graph_provider.to_ascii_lowercase(),
             graph_file_path: self.graph_file_path.to_string_lossy().into_owned(),
-            // The standalone server supports only the embedded ladybug graph;
-            // Postgres graph is not wired here.
-            graph_postgres_url: None,
+            // Aivory Cerveau patch: wire GRAPH_POSTGRES_URL through so the
+            // standalone server can use the `postgres` (pggraph) graph
+            // provider, not just the embedded ladybug graph. Validated by
+            // `validate_graph_config` before this runs, so a coherent
+            // postgres:// string reaches the adapter, or graph_provider isn't
+            // "postgres" and this is harmlessly None.
+            graph_postgres_url: self
+                .graph_postgres_url
+                .as_ref()
+                .map(|s| Ok(s.trim().to_string())),
             vector_provider,
             vector_db_url: self.vector_db_url.clone(),
             vector_postgres_url,

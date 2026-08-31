@@ -1,0 +1,86 @@
+name: cerveau-build
+
+# Aivory Cerveau patch 0001: builds cognee-http-server as a standalone
+# release binary, Postgres-only (pgvector + pggraph), zero native C++ deps.
+#
+# Upstream's default build compiles LanceDB (needs protoc, bundled Arrow/lance
+# C++) and the embedded ladybug graph store (needs cmake, bundled C++) on top
+# of a SQLite-backed vector/graph store neither of which Aivory wants: Cerveau
+# already runs Postgres (avry-postgres) with pgvector for its own memory, and
+# a third storage engine on a resource-tight VPS (~400MB free) is exactly the
+# RAGflow problem this integration was chosen specifically to avoid — see
+# docs/ADR-007-CERVEAU-COGNEE-INTEGRATION.md in AVRY-V2-Main.
+#
+# Feature set: pgvector + pggraph (both point at avry-postgres) + html-loader
+# + bin. Relational metadata (pipeline runs, ingestion records) stays on the
+# crate's default embedded SQLite -- small bookkeeping, not worth a Cargo.toml
+# surgery to move. No onnx (embeds via OpenRouter, matching Cerveau's own
+# embedding setup) and no telemetry (nothing phones home).
+
+on:
+  push:
+    branches: [cerveau-main]
+    paths-ignore:
+      - "docs/**"
+      - "*.md"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - name: cargo check (postgres-only feature set)
+        run: |
+          cargo check -p cognee-http-server --no-default-features \
+            --features pgvector,pggraph,html-loader,bin
+
+  build-release:
+    needs: [check]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - name: cargo build --release (postgres-only feature set)
+        run: |
+          cargo build --release -p cognee-http-server --no-default-features \
+            --features pgvector,pggraph,html-loader,bin
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/cognee-http-server dist/
+          tar -czf cognee-cerveau-x86_64-linux.tar.gz -C dist cognee-http-server
+          sha256sum cognee-cerveau-x86_64-linux.tar.gz > cognee-cerveau-x86_64-linux.tar.gz.sha256
+      - name: Rolling release (cerveau-cd)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: cerveau-cd
+          name: "Aivory Cerveau — cognee-rs (rolling)"
+          prerelease: true
+          make_latest: false
+          files: |
+            cognee-cerveau-x86_64-linux.tar.gz
+            cognee-cerveau-x86_64-linux.tar.gz.sha256
+          body: |
+            Rolling build of `cognee-http-server`, postgres-only feature set
+            (pgvector + pggraph + html-loader + bin). Auto-published on every
+            push to `cerveau-main`. Not versioned -- always overwritten.

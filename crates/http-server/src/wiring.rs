@@ -59,7 +59,7 @@ pub async fn wire_default_backends_with(
     // Required backends — a failure here aborts startup.
     let storage = build_storage(&ctx).await?;
     let database = build_database(&ctx).await?;
-    let graph_db = wire_graph_db(registry, &ctx).await?;
+    let graph_db = wire_graph_db(cfg, registry, &ctx).await?;
     let vector_db = wire_vector_db(cfg, registry, &ctx).await?;
 
     // Optional backends — a failure downgrades to `None` (handlers surface a
@@ -129,10 +129,39 @@ pub async fn wire_default_backends_with(
     })
 }
 
+/// Validate the pggraph configuration. Mirrors `validate_vector_config`:
+/// kept in the server wrapper so a misconfigured `GRAPH_POSTGRES_URL` fails
+/// with an actionable message instead of the registry's generic connection
+/// error.
+fn validate_graph_config(cfg: &HttpServerConfig) -> Result<(), ServerError> {
+    let provider = cfg.graph_provider.to_ascii_lowercase();
+    if provider != "postgres" && provider != "postgresql" {
+        return Ok(());
+    }
+    let url = cfg
+        .graph_postgres_url
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default();
+    if url.is_empty() {
+        return Err(ServerError::Other(anyhow!(
+            "GRAPH_POSTGRES_URL (postgres connection string) is required when              GRAPH_DATABASE_PROVIDER=postgres"
+        )));
+    }
+    if !(url.starts_with("postgres://") || url.starts_with("postgresql://")) {
+        return Err(ServerError::Other(anyhow!(
+            "GRAPH_DATABASE_PROVIDER=postgres requires a postgres connection string in              GRAPH_POSTGRES_URL (postgres://… or postgresql://…), but got '{url}'."
+        )));
+    }
+    Ok(())
+}
+
 async fn wire_graph_db(
+    cfg: &HttpServerConfig,
     registry: &ComponentRegistry,
     ctx: &cognee_components::BackendBuildContext,
 ) -> Result<Arc<dyn GraphDBTrait>, ServerError> {
+    validate_graph_config(cfg)?;
     // Delegate to the registry (like wire_vector_db): it already errors with an
     // actionable "registered providers: [...]" message for anything it doesn't
     // know, and — crucially — this keeps the extension seam intact so a
