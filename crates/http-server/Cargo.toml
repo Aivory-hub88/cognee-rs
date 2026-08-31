@@ -36,6 +36,15 @@ name = "cognee-http-server"
 path = "src/main.rs"
 required-features = ["bin"]
 
+# Aivory Cerveau patch: same server, plus a real per-request tenant
+# AuthResolver (see src/bin/cerveau-server.rs) -- the OSS `bin` target above
+# always runs with auth_resolver=None, so require_authentication=true there
+# just 401s every request with no way to actually authenticate.
+[[bin]]
+name = "cerveau-server"
+path = "src/bin/cerveau-server.rs"
+required-features = ["bin"]
+
 [features]
 # decision 1: telemetry is ON by default in cognee-http-server. Disable with
 # --no-default-features for compile-time opt-out.
