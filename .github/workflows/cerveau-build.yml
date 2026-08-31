@@ -16,6 +16,12 @@ name: cerveau-build
 # crate's default embedded SQLite -- small bookkeeping, not worth a Cargo.toml
 # surgery to move. No onnx (embeds via OpenRouter, matching Cerveau's own
 # embedding setup) and no telemetry (nothing phones home).
+#
+# Ships TWO binaries: the vanilla `cognee-http-server` (kept for reference/
+# local testing) and `cerveau-server` (crates/http-server/src/bin/
+# cerveau-server.rs) -- same server, plus the tenant `AuthResolver` that
+# gives Cerveau real per-tenant isolation. `cerveau-server` is what actually
+# gets deployed.
 
 on:
   push:
@@ -45,10 +51,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
-      - name: cargo check (postgres-only feature set)
+      - name: cargo check (postgres-only feature set, both bins)
         run: |
           cargo check -p cognee-http-server --no-default-features \
-            --features pgvector,pggraph,html-loader,bin
+            --features pgvector,pggraph,html-loader,bin \
+            --bins
 
   build-release:
     needs: [check]
@@ -60,15 +67,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
-      - name: cargo build --release (postgres-only feature set)
+      - name: cargo build --release (postgres-only feature set, both bins)
         run: |
           cargo build --release -p cognee-http-server --no-default-features \
-            --features pgvector,pggraph,html-loader,bin
+            --features pgvector,pggraph,html-loader,bin \
+            --bins
       - name: Package
         run: |
           mkdir -p dist
-          cp target/release/cognee-http-server dist/
-          tar -czf cognee-cerveau-x86_64-linux.tar.gz -C dist cognee-http-server
+          cp target/release/cognee-http-server target/release/cerveau-server dist/
+          tar -czf cognee-cerveau-x86_64-linux.tar.gz -C dist cognee-http-server cerveau-server
           sha256sum cognee-cerveau-x86_64-linux.tar.gz > cognee-cerveau-x86_64-linux.tar.gz.sha256
       - name: Rolling release (cerveau-cd)
         uses: softprops/action-gh-release@v2
@@ -81,6 +89,8 @@ jobs:
             cognee-cerveau-x86_64-linux.tar.gz
             cognee-cerveau-x86_64-linux.tar.gz.sha256
           body: |
-            Rolling build of `cognee-http-server`, postgres-only feature set
-            (pgvector + pggraph + html-loader + bin). Auto-published on every
-            push to `cerveau-main`. Not versioned -- always overwritten.
+            Rolling build, postgres-only feature set (pgvector + pggraph +
+            html-loader + bin). Contains both `cognee-http-server` (vanilla)
+            and `cerveau-server` (adds the tenant AuthResolver -- this is the
+            one to deploy). Auto-published on every push to `cerveau-main`.
+            Not versioned -- always overwritten.
