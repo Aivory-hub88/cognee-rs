@@ -21,6 +21,7 @@ pub mod config;
 pub mod dto;
 pub mod error;
 pub mod health;
+pub mod ingest_gate;
 pub mod lifecycle;
 pub mod middleware;
 pub mod multipart;

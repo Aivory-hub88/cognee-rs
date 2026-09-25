@@ -220,6 +220,78 @@ pub async fn post_add(
         unreachable!("validated above")
     };
 
+    // ── Durable-fact gate (Cerveau fork; see crate::ingest_gate) ────────────
+    let gate_mode = crate::ingest_gate::mode();
+    if gate_mode != crate::ingest_gate::GateMode::Off {
+        let mut texts: Vec<String> = Vec::new();
+        for part in &req.files {
+            if part.url_payload.is_none() && part.byte_count <= crate::ingest_gate::MAX_GATED_BYTES {
+                if let Ok(bytes) = tokio::fs::read(&part.temp_path).await {
+                    let text = String::from_utf8_lossy(&bytes).trim().to_string();
+                    if !text.is_empty() {
+                        texts.push(text);
+                    }
+                }
+            }
+        }
+        // Gate only pure-text adds: any URL or large document keeps the add.
+        let all_gated = !texts.is_empty() && texts.len() == req.files.len();
+        let threshold = crate::ingest_gate::threshold();
+        let tenant = user.tenant_id.map(|t| t.to_string()).unwrap_or_default();
+        match gate_mode {
+            crate::ingest_gate::GateMode::Shadow => {
+                let dataset = dataset_name.clone();
+                tokio::spawn(async move {
+                    for text in texts {
+                        let score = crate::ingest_gate::judge(&text).await;
+                        tracing::info!(
+                            target: "ingest_gate",
+                            mode = "shadow",
+                            tenant = %tenant,
+                            dataset = %dataset,
+                            noul = ?score,
+                            would_drop = all_gated && crate::ingest_gate::should_drop(&[score], threshold),
+                            preview = %crate::ingest_gate::preview(&text),
+                            "ingest gate verdict"
+                        );
+                    }
+                });
+            }
+            crate::ingest_gate::GateMode::Enforce if all_gated => {
+                let mut scores = Vec::with_capacity(texts.len());
+                for text in &texts {
+                    scores.push(crate::ingest_gate::judge(text).await);
+                }
+                let drop = crate::ingest_gate::should_drop(&scores, threshold);
+                tracing::info!(
+                    target: "ingest_gate",
+                    mode = "enforce",
+                    tenant = %tenant,
+                    dataset = %dataset_name,
+                    noul = ?scores,
+                    dropped = drop,
+                    preview = %crate::ingest_gate::preview(&texts[0]),
+                    "ingest gate verdict"
+                );
+                if drop {
+                    // 200, not an error: the caller did nothing wrong, and
+                    // Cerveau treats any non-2xx as a failed memory write.
+                    let body = json!({
+                        "status": "skipped",
+                        "reason": "ingest gate: not a durable fact",
+                        "noul": scores,
+                    });
+                    return axum::response::Response::builder()
+                        .status(StatusCode::OK)
+                        .header("Content-Type", "application/json")
+                        .body(axum::body::Body::from(body.to_string()))
+                        .map_err(|e| ApiError::Internal(anyhow::anyhow!("response build error: {e}")));
+                }
+            }
+            _ => {}
+        }
+    }
+
     // Build data inputs.
     let mut inputs: Vec<DataInput> = Vec::new();
     for part in &req.files {
