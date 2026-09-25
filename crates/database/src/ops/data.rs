@@ -280,6 +280,90 @@ pub async fn clear_pipeline_status_for_dataset(
     Ok(updated_count)
 }
 
+/// Per-data-item status value Python cognee writes under
+/// `pipeline_status["cognify_pipeline"][<dataset_id>]` once an item has been
+/// cognified (`run_tasks_data_item`), and what incremental cognify skips on.
+pub const COGNIFY_DATA_ITEM_COMPLETED: &str = "DATA_ITEM_PROCESSING_COMPLETED";
+
+/// True when a Data row's `pipeline_status` JSON marks it cognified for
+/// `dataset_id`. Malformed or missing JSON reads as "not yet", so a bad row
+/// is re-processed rather than silently dropped from the graph.
+pub fn is_cognify_completed_for_dataset(pipeline_status: Option<&str>, dataset_id: Uuid) -> bool {
+    let Some(raw) = pipeline_status else {
+        return false;
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    parsed
+        .get("cognify_pipeline")
+        .and_then(|inner| inner.get(uuid_hex::to_hex(dataset_id)))
+        .and_then(|v| v.as_str())
+        == Some(COGNIFY_DATA_ITEM_COMPLETED)
+}
+
+/// Record that `data_ids` were cognified for `dataset_id`: sets
+/// `pipeline_status["cognify_pipeline"][<dataset_id>]` to
+/// [`COGNIFY_DATA_ITEM_COMPLETED`], preserving every other entry. The inverse
+/// of [`clear_cognify_pipeline_status_for_data`], which delete already calls,
+/// so forgetting an item makes the next cognify pick it up again.
+#[instrument(
+    name = "cognee.db.relational.data.mark_cognify_completed_for_data",
+    level = "info",
+    skip_all,
+    fields(
+        cognee.db.system = tracing::field::Empty,
+        cognee.db.row_count = tracing::field::Empty,
+    ),
+    err,
+)]
+pub async fn mark_cognify_completed_for_data(
+    db: &DatabaseConnection,
+    data_ids: &[Uuid],
+    dataset_id: Uuid,
+) -> Result<u64, DatabaseError> {
+    Span::current().record(COGNEE_DB_SYSTEM, database_system_label(db));
+    let dataset_key = uuid_hex::to_hex(dataset_id);
+    let mut updated: u64 = 0;
+    for data_id in data_ids {
+        let Some(model) = data::Entity::find_by_id(uuid_hex::to_hex(*data_id))
+            .one(db)
+            .await
+            .map_err(map_sea_err)?
+        else {
+            continue;
+        };
+        let mut top: serde_json::Map<String, serde_json::Value> = model
+            .pipeline_status
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .and_then(|v| match v {
+                serde_json::Value::Object(m) => Some(m),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let mut inner = match top.remove("cognify_pipeline") {
+            Some(serde_json::Value::Object(m)) => m,
+            _ => serde_json::Map::new(),
+        };
+        inner.insert(
+            dataset_key.clone(),
+            serde_json::Value::String(COGNIFY_DATA_ITEM_COMPLETED.into()),
+        );
+        top.insert("cognify_pipeline".into(), serde_json::Value::Object(inner));
+        let serialized = serde_json::to_string(&serde_json::Value::Object(top)).map_err(|e| {
+            DatabaseError::QueryError(format!("Failed to serialize pipeline_status: {e}"))
+        })?;
+        let mut active = model.into_active_model();
+        active.pipeline_status = Set(Some(serialized));
+        active.updated_at = Set(Some(Utc::now()));
+        active.update(db).await.map_err(map_sea_err)?;
+        updated += 1;
+    }
+    Span::current().record(COGNEE_DB_ROW_COUNT, updated as i64);
+    Ok(updated)
+}
+
 /// Clear only the `cognify_pipeline` entry for `dataset_id` from a single
 /// Data record's `pipeline_status` JSON. All other entries are preserved.
 ///
@@ -380,4 +464,24 @@ pub async fn list_datasets_for_data(
         .collect();
     Span::current().record(COGNEE_DB_ROW_COUNT, datasets.len() as i64);
     Ok(datasets)
+}
+
+#[cfg(test)]
+mod cognify_status_tests {
+    use super::*;
+
+    #[test]
+    fn reads_per_dataset_cognify_completion() {
+        let ds = Uuid::parse_str("45534e3f-01ce-5b52-9c2b-5568436c5417").unwrap_or_default();
+        let other = Uuid::new_v4();
+        let done = format!(
+            r#"{{"cognify_pipeline":{{"{}":"DATA_ITEM_PROCESSING_COMPLETED"}},"add_pipeline":{{"x":"y"}}}}"#,
+            uuid_hex::to_hex(ds)
+        );
+        assert!(is_cognify_completed_for_dataset(Some(&done), ds));
+        assert!(!is_cognify_completed_for_dataset(Some(&done), other));
+        assert!(!is_cognify_completed_for_dataset(None, ds));
+        assert!(!is_cognify_completed_for_dataset(Some("not json"), ds));
+        assert!(!is_cognify_completed_for_dataset(Some(r#"{"cognify_pipeline":"weird"}"#), ds));
+    }
 }

@@ -132,7 +132,13 @@ pub async fn post_cognify(
         }
     }
 
-    let run_in_background = payload.run_in_background.unwrap_or(false);
+    // Cerveau fork: `COGNEE_FORCE_BACKGROUND_COGNIFY=true` runs every cognify
+    // in the background. A blocking run executes inside the request, so a
+    // client that gives up (Cerveau waits ~60s; a real extraction pass takes
+    // longer) left no finished work behind. Callers that only check for a 2xx
+    // (Cerveau's graph_sync) are unaffected by getting "started" back.
+    let run_in_background =
+        payload.run_in_background.unwrap_or(false) || force_background_cognify();
 
     // Build a request-scoped ontology resolver from explicit payload keys.
     // If keys are provided and any key is unknown, return a non-200 error
@@ -444,12 +450,42 @@ async fn run_real_cognify(
         config
     };
 
+    // One cognify per dataset at a time. A second trigger while one runs would
+    // only redo the same pending items; the running pass (or the next
+    // trigger) picks up anything added meanwhile.
+    let Some(_guard) = DatasetRunGuard::acquire(dataset_id) else {
+        tracing::info!(%dataset_id, "cognify already running for dataset; skipping this trigger");
+        return Ok(());
+    };
+
     // ── Resolve dataset data rows ─────────────────────────────────────────────
-    let data_items = db_ops::datasets::get_dataset_data(&database, dataset_id)
+    let all_items = db_ops::datasets::get_dataset_data(&database, dataset_id)
         .await
         .map_err(|e| {
             CognifyDispatchError(format!("failed to load data for dataset {dataset_id}: {e}"))
         })?;
+
+    // Incremental: `CognifyConfig::incremental_loading` (default true, Python
+    // parity) existed but nothing read it, so every trigger re-extracted the
+    // whole dataset through the LLM (100+ documents on a live tenant), timed
+    // out, and never marked anything done. Skip items already cognified for
+    // this dataset and mark each batch as it completes.
+    let pending: Vec<_> = if config.incremental_loading {
+        all_items
+            .into_iter()
+            .filter(|d| {
+                !db_ops::data::is_cognify_completed_for_dataset(d.pipeline_status.as_deref(), dataset_id)
+            })
+            .collect()
+    } else {
+        all_items
+    };
+    if pending.is_empty() {
+        tracing::info!(%dataset_id, "cognify: nothing new to process");
+        return Ok(());
+    }
+    let batch_size = cognify_batch_items();
+    tracing::info!(%dataset_id, pending = pending.len(), batch_size, "cognify: processing pending items in batches");
 
     // OSS build has no DB-backed user lookup (the `users` table is owned by
     // the closed cloud build), so `user_email` always falls back to `None`.
@@ -462,27 +498,77 @@ async fn run_real_cognify(
     // no-op repo so its `DbPipelineWatcher` does not produce a second row-set.
     let pipeline_run_repo = NoopPipelineRunRepository::arc();
 
-    run_cognify(
-        data_items,
-        dataset_id,
-        Some(user.id),
-        user_email,
-        user.tenant_id,
-        llm,
-        storage,
-        graph_db,
-        vector_db,
-        embedding_engine,
-        database,
-        pipeline_run_repo,
-        thread_pool,
-        ontology_resolver,
-        config,
-    )
-    .await
-    .map_err(|e| CognifyDispatchError(format!("cognify failed: {e}")))?;
+    for batch in pending.chunks(batch_size) {
+        run_cognify(
+            batch.to_vec(),
+            dataset_id,
+            Some(user.id),
+            user_email.clone(),
+            user.tenant_id,
+            Arc::clone(&llm),
+            storage.clone(),
+            Arc::clone(&graph_db),
+            Arc::clone(&vector_db),
+            Arc::clone(&embedding_engine),
+            database.clone(),
+            Arc::clone(&pipeline_run_repo),
+            Arc::clone(&thread_pool),
+            Arc::clone(&ontology_resolver),
+            config,
+        )
+        .await
+        .map_err(|e| CognifyDispatchError(format!("cognify failed: {e}")))?;
+
+        // Persist progress per batch: a later failure never redoes this one.
+        let ids: Vec<Uuid> = batch.iter().map(|d| d.id).collect();
+        db_ops::data::mark_cognify_completed_for_data(&database, &ids, dataset_id)
+            .await
+            .map_err(|e| CognifyDispatchError(format!("failed to record cognify progress: {e}")))?;
+        tracing::info!(%dataset_id, done = ids.len(), "cognify: batch completed and recorded");
+    }
 
     Ok(())
+}
+
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+fn force_background_cognify() -> bool {
+    env_truthy("COGNEE_FORCE_BACKGROUND_COGNIFY")
+}
+
+/// Items per cognify pass (`COGNEE_COGNIFY_BATCH_ITEMS`, default 10, min 1).
+fn cognify_batch_items() -> usize {
+    std::env::var("COGNEE_COGNIFY_BATCH_ITEMS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(10)
+}
+
+static RUNNING_DATASETS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<Uuid>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// Marks a dataset as being cognified for as long as it lives.
+struct DatasetRunGuard(Uuid);
+
+impl DatasetRunGuard {
+    fn acquire(dataset_id: Uuid) -> Option<Self> {
+        let mut running = RUNNING_DATASETS.lock().unwrap_or_else(|e| e.into_inner());
+        running.insert(dataset_id).then_some(Self(dataset_id))
+    }
+}
+
+impl Drop for DatasetRunGuard {
+    fn drop(&mut self) {
+        RUNNING_DATASETS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+    }
 }
 
 // ─── ws_subscribe ─────────────────────────────────────────────────────────────
@@ -631,6 +717,19 @@ pub fn router() -> Router<AppState> {
     reason = "test code — panics are acceptable failures"
 )]
 mod tests {
+
+    #[test]
+    fn dataset_run_guard_allows_one_run_per_dataset() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let first = super::DatasetRunGuard::acquire(a);
+        assert!(first.is_some());
+        assert!(super::DatasetRunGuard::acquire(a).is_none(), "second run of the same dataset is refused");
+        assert!(super::DatasetRunGuard::acquire(b).is_some(), "other datasets are independent");
+        drop(first);
+        assert!(super::DatasetRunGuard::acquire(a).is_some(), "released when the run ends");
+    }
+
     use super::*;
     use axum::{
         body::Body,
