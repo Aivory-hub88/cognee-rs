@@ -558,7 +558,13 @@ struct DatasetRunGuard(Uuid);
 impl DatasetRunGuard {
     fn acquire(dataset_id: Uuid) -> Option<Self> {
         let mut running = RUNNING_DATASETS.lock().unwrap_or_else(|e| e.into_inner());
-        running.insert(dataset_id).then_some(Self(dataset_id))
+        // `then`, not `then_some`: `then_some` builds the guard eagerly, so when
+        // the dataset is already running the unused guard is dropped right here,
+        // and its `Drop` locks `RUNNING_DATASETS` again while `running` still
+        // holds it. A std `Mutex` is not re-entrant, so that thread blocked
+        // forever, and every later cognify (any dataset) queued behind it until
+        // all runtime workers were stuck and the server stopped answering.
+        running.insert(dataset_id).then(|| Self(dataset_id))
     }
 }
 
@@ -720,14 +726,23 @@ mod tests {
 
     #[test]
     fn dataset_run_guard_allows_one_run_per_dataset() {
-        let a = Uuid::new_v4();
-        let b = Uuid::new_v4();
-        let first = super::DatasetRunGuard::acquire(a);
-        assert!(first.is_some());
-        assert!(super::DatasetRunGuard::acquire(a).is_none(), "second run of the same dataset is refused");
-        assert!(super::DatasetRunGuard::acquire(b).is_some(), "other datasets are independent");
-        drop(first);
-        assert!(super::DatasetRunGuard::acquire(a).is_some(), "released when the run ends");
+        // Run on a thread with a deadline: the bug this guards against (a
+        // refused acquire re-locking the mutex it already holds) hangs forever
+        // instead of failing, which would stall CI rather than report it.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let a = Uuid::new_v4();
+            let b = Uuid::new_v4();
+            let first = super::DatasetRunGuard::acquire(a);
+            assert!(first.is_some());
+            assert!(super::DatasetRunGuard::acquire(a).is_none(), "second run of the same dataset is refused");
+            assert!(super::DatasetRunGuard::acquire(b).is_some(), "other datasets are independent");
+            drop(first);
+            assert!(super::DatasetRunGuard::acquire(a).is_some(), "released when the run ends");
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("DatasetRunGuard::acquire deadlocked (or the assertions above failed)");
     }
 
     use super::*;
