@@ -5,6 +5,7 @@ use cognee_embedding::EmbeddingEngine;
 use cognee_session::SessionContext;
 use cognee_vector::VectorDB;
 
+use crate::recall_stage::{self, timed};
 use crate::retrievers::SearchRetriever;
 use crate::retrievers::context_items::search_results_to_context;
 use crate::types::{SearchContext, SearchError, SearchOutput, SearchParams, SearchType};
@@ -33,6 +34,48 @@ impl SummariesRetriever {
     }
 }
 
+impl SummariesRetriever {
+    async fn get_context_inner(
+        &self,
+        query: &str,
+        params: &SearchParams,
+    ) -> Result<SearchContext, SearchError> {
+        if !timed(
+            recall_stage::COLLECTION_CHECK,
+            self.vector_db
+                .has_collection(SUMMARIES_DATA_TYPE, SUMMARIES_FIELD_NAME),
+        )
+        .await?
+        {
+            return Err(SearchError::NotFound(
+                "missing vector collection: TextSummary_text".to_string(),
+            ));
+        }
+
+        let embeddings = timed(
+            recall_stage::EMBED_QUERY,
+            self.embedding_engine.embed(&[query]),
+        )
+        .await?;
+        let query_vector = embeddings.into_iter().next().ok_or_else(|| {
+            SearchError::InvalidInput("embedding engine returned no vectors".to_string())
+        })?;
+
+        let results = timed(
+            recall_stage::VECTOR_SEARCH,
+            self.vector_db.search_similar(
+                SUMMARIES_DATA_TYPE,
+                SUMMARIES_FIELD_NAME,
+                &query_vector,
+                params.top_k_or(self.top_k),
+            ),
+        )
+        .await?;
+
+        search_results_to_context(results)
+    }
+}
+
 #[async_trait]
 impl SearchRetriever for SummariesRetriever {
     fn search_type(&self) -> SearchType {
@@ -44,32 +87,9 @@ impl SearchRetriever for SummariesRetriever {
         query: &str,
         params: &SearchParams,
     ) -> Result<SearchContext, SearchError> {
-        if !self
-            .vector_db
-            .has_collection(SUMMARIES_DATA_TYPE, SUMMARIES_FIELD_NAME)
-            .await?
-        {
-            return Err(SearchError::NotFound(
-                "missing vector collection: TextSummary_text".to_string(),
-            ));
-        }
-
-        let embeddings = self.embedding_engine.embed(&[query]).await?;
-        let query_vector = embeddings.into_iter().next().ok_or_else(|| {
-            SearchError::InvalidInput("embedding engine returned no vectors".to_string())
-        })?;
-
-        let results = self
-            .vector_db
-            .search_similar(
-                SUMMARIES_DATA_TYPE,
-                SUMMARIES_FIELD_NAME,
-                &query_vector,
-                params.top_k_or(self.top_k),
-            )
-            .await?;
-
-        search_results_to_context(results)
+        // Cerveau's per-turn recall uses SUMMARIES, which never touches the graph retrievers,
+        // so it needs its own stage events (see `recall_stage`): `total` plus one per step.
+        timed(recall_stage::TOTAL, self.get_context_inner(query, params)).await
     }
 
     async fn get_completion(
@@ -236,6 +256,45 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(SearchError::NotFound(_))));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn emits_one_stage_event_per_step_and_a_total() {
+        let (buf, _guard) = crate::recall_stage::tests::capture();
+        let retriever = SummariesRetriever::new(
+            Arc::new(TestVectorDb {
+                has_collection: true,
+                results: vec![],
+            }),
+            Arc::new(TestEmbeddingEngine),
+            Some(2),
+        );
+        retriever
+            .get_context("secret query text", &SearchParams::default())
+            .await
+            .unwrap();
+
+        let raw = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(!raw.contains("secret query text"), "query text must never be logged");
+        let stages: Vec<(String, String)> = crate::recall_stage::tests::events(&buf)
+            .iter()
+            .map(|e| {
+                (
+                    e["fields"]["stage"].as_str().unwrap().to_string(),
+                    e["fields"]["outcome"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        let ok = |s: &str| (s.to_string(), "ok".to_string());
+        assert_eq!(
+            stages,
+            vec![
+                ok("collection_check"),
+                ok("embed_query"),
+                ok("vector_search"),
+                ok("total"),
+            ]
+        );
     }
 
     #[tokio::test]
