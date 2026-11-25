@@ -31,6 +31,8 @@ use std::time::Instant;
 /// `tracing` target of every stage event.
 pub const TARGET: &str = "cognee::recall_stage";
 
+/// Checking that the vector collection exists (one backend round trip).
+pub const COLLECTION_CHECK: &str = "collection_check";
 /// Embedding the query text.
 pub const EMBED_QUERY: &str = "embed_query";
 /// Similarity search across the vector collections.
@@ -116,13 +118,13 @@ where
     clippy::expect_used,
     reason = "test code — panics are acceptable failures"
 )]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     #[derive(Clone, Default)]
-    struct Buf(Arc<Mutex<Vec<u8>>>);
+    pub(crate) struct Buf(pub(crate) Arc<Mutex<Vec<u8>>>);
 
     impl std::io::Write for Buf {
         fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
@@ -141,7 +143,7 @@ mod tests {
         }
     }
 
-    fn capture() -> (Buf, tracing::subscriber::DefaultGuard) {
+    pub(crate) fn capture() -> (Buf, tracing::subscriber::DefaultGuard) {
         let buf = Buf::default();
         let sub = tracing_subscriber::fmt()
             .json()
@@ -151,7 +153,7 @@ mod tests {
         (buf, tracing::subscriber::set_default(sub))
     }
 
-    fn events(buf: &Buf) -> Vec<serde_json::Value> {
+    pub(crate) fn events(buf: &Buf) -> Vec<serde_json::Value> {
         let raw = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
         raw.lines()
             .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
