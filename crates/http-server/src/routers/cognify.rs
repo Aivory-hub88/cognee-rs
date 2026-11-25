@@ -474,10 +474,7 @@ async fn run_real_cognify(
         all_items
             .into_iter()
             .filter(|d| {
-                !db_ops::data::is_cognify_completed_for_dataset(
-                    d.pipeline_status.as_deref(),
-                    dataset_id,
-                )
+                !db_ops::data::is_cognify_completed_for_dataset(d.pipeline_status.as_deref(), dataset_id)
             })
             .collect()
     } else {
@@ -535,12 +532,7 @@ async fn run_real_cognify(
 
 fn env_truthy(name: &str) -> bool {
     std::env::var(name)
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false)
 }
 
@@ -743,19 +735,10 @@ mod tests {
             let b = Uuid::new_v4();
             let first = super::DatasetRunGuard::acquire(a);
             assert!(first.is_some());
-            assert!(
-                super::DatasetRunGuard::acquire(a).is_none(),
-                "second run of the same dataset is refused"
-            );
-            assert!(
-                super::DatasetRunGuard::acquire(b).is_some(),
-                "other datasets are independent"
-            );
+            assert!(super::DatasetRunGuard::acquire(a).is_none(), "second run of the same dataset is refused");
+            assert!(super::DatasetRunGuard::acquire(b).is_some(), "other datasets are independent");
             drop(first);
-            assert!(
-                super::DatasetRunGuard::acquire(a).is_some(),
-                "released when the run ends"
-            );
+            assert!(super::DatasetRunGuard::acquire(a).is_some(), "released when the run ends");
             let _ = tx.send(());
         });
         rx.recv_timeout(std::time::Duration::from_secs(10))

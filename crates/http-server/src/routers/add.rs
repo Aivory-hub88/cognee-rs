@@ -225,8 +225,7 @@ pub async fn post_add(
     if gate_mode != crate::ingest_gate::GateMode::Off {
         let mut texts: Vec<String> = Vec::new();
         for part in &req.files {
-            if part.url_payload.is_none() && part.byte_count <= crate::ingest_gate::MAX_GATED_BYTES
-            {
+            if part.url_payload.is_none() && part.byte_count <= crate::ingest_gate::MAX_GATED_BYTES {
                 if let Ok(bytes) = tokio::fs::read(&part.temp_path).await {
                     let text = String::from_utf8_lossy(&bytes).trim().to_string();
                     if !text.is_empty() {
@@ -286,9 +285,7 @@ pub async fn post_add(
                         .status(StatusCode::OK)
                         .header("Content-Type", "application/json")
                         .body(axum::body::Body::from(body.to_string()))
-                        .map_err(|e| {
-                            ApiError::Internal(anyhow::anyhow!("response build error: {e}"))
-                        });
+                        .map_err(|e| ApiError::Internal(anyhow::anyhow!("response build error: {e}")));
                 }
             }
             _ => {}
