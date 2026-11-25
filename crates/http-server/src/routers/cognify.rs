@@ -745,6 +745,41 @@ mod tests {
             .expect("DatasetRunGuard::acquire deadlocked (or the assertions above failed)");
     }
 
+    #[test]
+    fn dataset_run_guard_contended_acquire_never_hangs_and_never_double_grants() {
+        // Many threads race for a few datasets. Refused acquires used to drop an
+        // eagerly built guard under the lock, so contention was exactly what
+        // wedged the process. Count live holders per dataset to also prove that
+        // two runs of one dataset can never be granted at once.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let datasets: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+        let holders: Vec<std::sync::Arc<AtomicUsize>> = (0..datasets.len())
+            .map(|_| std::sync::Arc::new(AtomicUsize::new(0)))
+            .collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        for t in 0..8 {
+            let datasets = datasets.clone();
+            let holders = holders.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                for i in 0..2_000usize {
+                    let k = (t + i) % datasets.len();
+                    if let Some(guard) = super::DatasetRunGuard::acquire(datasets[k]) {
+                        let live = holders[k].fetch_add(1, Ordering::SeqCst) + 1;
+                        assert_eq!(live, 1, "dataset granted to two runs at once");
+                        holders[k].fetch_sub(1, Ordering::SeqCst);
+                        drop(guard);
+                    }
+                }
+                let _ = tx.send(());
+            });
+        }
+        for _ in 0..8 {
+            rx.recv_timeout(std::time::Duration::from_secs(30))
+                .expect("contended DatasetRunGuard::acquire deadlocked (or double-granted)");
+        }
+    }
+
     use super::*;
     use axum::{
         body::Body,
