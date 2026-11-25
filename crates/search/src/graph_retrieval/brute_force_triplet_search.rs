@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::recall_stage::{self, timed};
 use cognee_embedding::EmbeddingEngine;
 use cognee_graph::GraphDBTrait;
 use cognee_vector::VectorDB;
@@ -134,6 +135,22 @@ pub async fn brute_force_triplet_search(
     graph_db: &dyn GraphDBTrait,
     config: &GraphRetrievalConfig,
 ) -> Result<Vec<RankedGraphEdge>, SearchError> {
+    // `total` plus one event per stage (see `recall_stage`). A caller-side
+    // timeout drops this future, which logs the running stage as `cancelled`.
+    timed(
+        recall_stage::TOTAL,
+        brute_force_triplet_search_inner(query, vector_db, embedding_engine, graph_db, config),
+    )
+    .await
+}
+
+async fn brute_force_triplet_search_inner(
+    query: &str,
+    vector_db: &dyn VectorDB,
+    embedding_engine: &dyn EmbeddingEngine,
+    graph_db: &dyn GraphDBTrait,
+    config: &GraphRetrievalConfig,
+) -> Result<Vec<RankedGraphEdge>, SearchError> {
     if config.feedback_influence < 0.0 || config.feedback_influence > 1.0 {
         return Err(SearchError::InvalidInput(
             "feedback_influence must be in range [0.0, 1.0]".to_string(),
@@ -148,7 +165,7 @@ pub async fn brute_force_triplet_search(
         )));
     }
 
-    let query_vectors = embedding_engine.embed(&[query]).await?;
+    let query_vectors = timed(recall_stage::EMBED_QUERY, embedding_engine.embed(&[query])).await?;
     let query_vector = query_vectors.into_iter().next().ok_or_else(|| {
         SearchError::InvalidInput("embedding engine returned no vectors".to_string())
     })?;
@@ -164,59 +181,64 @@ pub async fn brute_force_triplet_search(
     // their metadata (confirmed in cognify tasks.rs).
     let mut edge_type_distances = HashMap::<String, f32>::new();
 
-    for (data_type, field_name) in SEARCH_COLLECTIONS {
-        if !vector_db.has_collection(data_type, field_name).await? {
-            debug!("vector collection {data_type}/{field_name} does not exist — skipping");
-            continue;
-        }
+    timed(recall_stage::VECTOR_SEARCH, async {
+        for (data_type, field_name) in SEARCH_COLLECTIONS {
+            if !vector_db.has_collection(data_type, field_name).await? {
+                debug!("vector collection {data_type}/{field_name} does not exist — skipping");
+                continue;
+            }
 
-        let results = vector_db
-            .search_similar(
-                data_type,
-                field_name,
-                &query_vector,
-                config.wide_search_top_k,
-            )
-            .await?;
+            let results = vector_db
+                .search_similar(
+                    data_type,
+                    field_name,
+                    &query_vector,
+                    config.wide_search_top_k,
+                )
+                .await?;
 
-        for result in results {
-            // Convert Qdrant cosine similarity to cosine distance: distance = 1 - similarity
-            let distance = 1.0 - result.score;
+            for result in results {
+                // Convert Qdrant cosine similarity to cosine distance: distance = 1 - similarity
+                let distance = 1.0 - result.score;
 
-            if data_type == "EdgeType" && field_name == "relationship_name" {
-                // Edge distances keyed by relationship_name from vector point metadata.
-                // edge_type_id is NOT stored in graph edge properties, so we key by
-                // relationship_name to match graph edges at scoring time.
-                if let Some(rel_name) = result
-                    .metadata
-                    .get("relationship_name")
-                    .and_then(|v| v.as_str())
-                {
-                    let entry = edge_type_distances
-                        .entry(rel_name.to_string())
-                        .or_insert(distance);
+                if data_type == "EdgeType" && field_name == "relationship_name" {
+                    // Edge distances keyed by relationship_name from vector point metadata.
+                    // edge_type_id is NOT stored in graph edge properties, so we key by
+                    // relationship_name to match graph edges at scoring time.
+                    if let Some(rel_name) = result
+                        .metadata
+                        .get("relationship_name")
+                        .and_then(|v| v.as_str())
+                    {
+                        let entry = edge_type_distances
+                            .entry(rel_name.to_string())
+                            .or_insert(distance);
+                        if distance < *entry {
+                            *entry = distance;
+                        }
+                    }
+                } else {
+                    // Node distances keyed by vector point ID.
+                    // Use min to merge across collections (lower distance = better match).
+                    let node_id = result.id.to_string();
+                    candidate_node_ids.insert(node_id.clone());
+                    let entry = node_distances.entry(node_id.clone()).or_insert(distance);
                     if distance < *entry {
                         *entry = distance;
                     }
-                }
-            } else {
-                // Node distances keyed by vector point ID.
-                // Use min to merge across collections (lower distance = better match).
-                let node_id = result.id.to_string();
-                candidate_node_ids.insert(node_id.clone());
-                let entry = node_distances.entry(node_id.clone()).or_insert(distance);
-                if distance < *entry {
-                    *entry = distance;
-                }
-                if let Some(dataset_id) = result.metadata.get("dataset_id").and_then(|v| v.as_str())
-                {
-                    node_dataset_ids
-                        .entry(node_id)
-                        .or_insert_with(|| dataset_id.to_string());
+                    if let Some(dataset_id) =
+                        result.metadata.get("dataset_id").and_then(|v| v.as_str())
+                    {
+                        node_dataset_ids
+                            .entry(node_id)
+                            .or_insert_with(|| dataset_id.to_string());
+                    }
                 }
             }
         }
-    }
+        Ok::<(), SearchError>(())
+    })
+    .await?;
 
     if candidate_node_ids.is_empty() {
         debug!("no candidate nodes found from vector search — returning empty");
@@ -247,9 +269,11 @@ pub async fn brute_force_triplet_search(
             .node_name
             .as_deref()
             .expect("node_name is checked non-empty in has_node_filter");
-        graph_db
-            .get_nodeset_subgraph(node_type, node_names, &config.node_name_filter_operator)
-            .await?
+        timed(
+            recall_stage::GRAPH_EXPANSION,
+            graph_db.get_nodeset_subgraph(node_type, node_names, &config.node_name_filter_operator),
+        )
+        .await?
     } else {
         // Scope the load to the seed set's neighborhood instead of pulling the
         // whole graph. This is result-identical to `get_graph_data()`, not merely
@@ -278,9 +302,11 @@ pub async fn brute_force_triplet_search(
         // Postgres CTE has no ORDER BY).
         let mut seed_ids: Vec<String> = candidate_node_ids.iter().cloned().collect();
         seed_ids.sort_unstable();
-        graph_db
-            .get_neighborhood(&seed_ids, NEIGHBORHOOD_DEPTH)
-            .await?
+        timed(
+            recall_stage::GRAPH_EXPANSION,
+            graph_db.get_neighborhood(&seed_ids, NEIGHBORHOOD_DEPTH),
+        )
+        .await?
     };
 
     // Extract name, text, description, and (optionally) feedback_weight from each node.

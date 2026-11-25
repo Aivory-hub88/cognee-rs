@@ -93,7 +93,8 @@ pub async fn judge(text: &str) -> Option<f64> {
         .or_else(|| std::env::var("LLM_API_KEY").ok())
         .filter(|k| !k.trim().is_empty())?;
     let url = std::env::var("COGNEE_INGEST_GATE_URL").unwrap_or_else(|_| DEFAULT_URL.to_string());
-    let model = std::env::var("COGNEE_INGEST_GATE_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+    let model =
+        std::env::var("COGNEE_INGEST_GATE_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
@@ -118,12 +119,20 @@ pub async fn judge(text: &str) -> Option<f64> {
 /// judged text and every judged text scored below the threshold. Unjudged
 /// (failed) parts count as keep.
 pub fn should_drop(scores: &[Option<f64>], threshold: f64) -> bool {
-    !scores.is_empty() && scores.iter().all(|s| matches!(s, Some(p) if *p < threshold))
+    !scores.is_empty()
+        && scores
+            .iter()
+            .all(|s| matches!(s, Some(p) if *p < threshold))
 }
 
 /// First ~120 chars on one line, for the shadow log.
 pub fn preview(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(120).collect()
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(120)
+        .collect()
 }
 
 #[cfg(test)]
@@ -143,16 +152,25 @@ mod tests {
         let ok = json!({"answers": {"durable": {"type": "noul", "noul": 0.02}}});
         assert_eq!(parse_noul(&ok), Some(0.02));
         assert_eq!(parse_noul(&json!({"answers": {}})), None);
-        assert_eq!(parse_noul(&json!({"answers": {"durable": {"noul": 7.0}}})), None);
+        assert_eq!(
+            parse_noul(&json!({"answers": {"durable": {"noul": 7.0}}})),
+            None
+        );
     }
 
     #[test]
     fn drops_only_when_every_judged_part_is_chatter() {
         assert!(should_drop(&[Some(0.02)], 0.10));
         assert!(!should_drop(&[Some(0.02), Some(0.6)], 0.10));
-        assert!(!should_drop(&[Some(0.02), None], 0.10), "a failed judgment keeps the add");
+        assert!(
+            !should_drop(&[Some(0.02), None], 0.10),
+            "a failed judgment keeps the add"
+        );
         assert!(!should_drop(&[], 0.10));
-        assert!(!should_drop(&[Some(0.10)], 0.10), "at the threshold is kept");
+        assert!(
+            !should_drop(&[Some(0.10)], 0.10),
+            "at the threshold is kept"
+        );
     }
 
     #[test]

@@ -12,6 +12,8 @@ pub mod query_router;
 pub mod query_router_stats;
 /// `RecallScope` and related types for scoping search results.
 pub mod recall_scope;
+/// Per-stage timing events for graph recall.
+pub mod recall_stage;
 /// Individual retriever implementations for each `SearchType`.
 pub mod retrievers;
 #[cfg(test)]

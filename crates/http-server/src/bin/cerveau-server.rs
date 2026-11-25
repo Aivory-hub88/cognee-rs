@@ -61,7 +61,10 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 struct TenantHeaderResolver {
@@ -133,9 +136,10 @@ async fn main() -> anyhow::Result<()> {
         cfg.env = env_val;
     }
 
-    let shared_secret = std::env::var("CERVEAU_INTERNAL_SECRET")
-        .context("CERVEAU_INTERNAL_SECRET must be set -- this binary's whole point is per-tenant \
-                  isolation, and without this secret the tenant headers are unauthenticated")?;
+    let shared_secret = std::env::var("CERVEAU_INTERNAL_SECRET").context(
+        "CERVEAU_INTERNAL_SECRET must be set -- this binary's whole point is per-tenant \
+                  isolation, and without this secret the tenant headers are unauthenticated",
+    )?;
     if shared_secret.trim().is_empty() {
         anyhow::bail!("CERVEAU_INTERNAL_SECRET is set but empty");
     }
@@ -172,9 +176,7 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("failed to bind {addr}"))?;
 
     tracing::info!("cerveau-server listening on {addr}, tenant isolation enforced");
-    axum::serve(listener, app)
-        .await
-        .context("server error")?;
+    axum::serve(listener, app).await.context("server error")?;
 
     Ok(())
 }
